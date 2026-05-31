@@ -1,4 +1,4 @@
-# This file is Copyright 2023 Volatility Foundation and licensed under the Volatility Software License 1.0
+﻿# This file is Copyright 2023 Volatility Foundation and licensed under the Volatility Software License 1.0
 # which is available at https://www.volatilityfoundation.org/license/vsl-v1.0
 #
 
@@ -23,7 +23,7 @@ class Addr(plugins.PluginInterface):
             requirements.ModuleRequirement(
                 name="kernel",
                 description="Linux kernel",
-                architectures=["Intel32", "Intel64"],
+                architectures=["Intel32", "Intel64", "AArch64"],
             ),
             requirements.VersionRequirement(
                 name="Net", component=network.NetSymbols, version=(1, 0, 0)
@@ -145,7 +145,7 @@ class Link(plugins.PluginInterface):
             requirements.ModuleRequirement(
                 name="kernel",
                 description="Linux kernel",
-                architectures=["Intel32", "Intel64"],
+                architectures=["Intel32", "Intel64", "AArch64"],
             ),
             requirements.VersionRequirement(
                 name="Net", component=network.NetSymbols, version=(1, 0, 0)
@@ -212,3 +212,4 @@ class Link(plugins.PluginInterface):
         ]
 
         return renderers.TreeGrid(headers, self._generator())
+

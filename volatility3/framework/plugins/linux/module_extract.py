@@ -1,4 +1,4 @@
-# This file is Copyright 2025 Volatility Foundation and licensed under the Volatility Software License 1.0
+﻿# This file is Copyright 2025 Volatility Foundation and licensed under the Volatility Software License 1.0
 # which is available at https://www.volatilityfoundation.org/license/vsl-v1.0
 #
 import logging
@@ -29,7 +29,7 @@ class ModuleExtract(interfaces.plugins.PluginInterface):
             requirements.ModuleRequirement(
                 name="kernel",
                 description="Windows kernel",
-                architectures=["Intel32", "Intel64"],
+                architectures=["Intel32", "Intel64", "AArch64"],
             ),
             requirements.IntRequirement(
                 name="base",
@@ -93,3 +93,4 @@ class ModuleExtract(interfaces.plugins.PluginInterface):
             ],
             self._generator(),
         )
+

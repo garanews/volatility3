@@ -1,4 +1,4 @@
-# This file is Copyright 2024 Volatility Foundation and licensed under the Volatility Software License 1.0
+﻿# This file is Copyright 2024 Volatility Foundation and licensed under the Volatility Software License 1.0
 # which is available at https://www.volatilityfoundation.org/license/vsl-v1.0
 #
 import datetime
@@ -23,7 +23,7 @@ class Boottime(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface)
             requirements.ModuleRequirement(
                 name="kernel",
                 description="Linux kernel",
-                architectures=["Intel32", "Intel64"],
+                architectures=["Intel32", "Intel64", "AArch64"],
             ),
             requirements.VersionRequirement(
                 name="timeliner",
@@ -100,3 +100,4 @@ class Boottime(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface)
             ("Boot Time", datetime.datetime),
         ]
         return renderers.TreeGrid(columns, self._generator())
+
