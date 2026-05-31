@@ -3,7 +3,7 @@
 #
 
 import logging
-from typing import List, Iterable
+from typing import List
 
 from volatility3.framework import renderers, interfaces, constants
 from volatility3.framework.symbols import linux
@@ -19,7 +19,8 @@ class PIDHashTable(plugins.PluginInterface):
     """Enumerates processes through the PID hash table"""
 
     _required_framework_version = (2, 0, 0)
-    _version = (1, 0, 3)
+
+    _version = (1, 0, 0)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -27,10 +28,10 @@ class PIDHashTable(plugins.PluginInterface):
             requirements.ModuleRequirement(
                 name="kernel",
                 description="Linux kernel",
-                architectures=["Intel32", "Intel64"],
+                architectures=["Intel32", "Intel64", "AArch64"],
             ),
-            requirements.VersionRequirement(
-                name="pslist", component=pslist.PsList, version=(4, 0, 0)
+            requirements.PluginRequirement(
+                name="pslist", plugin=pslist.PsList, version=(2, 0, 0)
             ),
             requirements.VersionRequirement(
                 name="linuxutils", component=linux.LinuxUtilities, version=(2, 1, 0)
@@ -44,7 +45,9 @@ class PIDHashTable(plugins.PluginInterface):
         ]
 
     def _is_valid_task(self, task) -> bool:
-        return bool(task and task.pid > 0 and task.parent.is_readable())
+        vmlinux = self.context.modules[self.config["kernel"]]
+        vmlinux_layer = self.context.layers[vmlinux.layer_name]
+        return bool(task and task.pid > 0 and vmlinux_layer.is_valid(task.parent))
 
     def _get_pidtype_pid(self):
         vmlinux = self.context.modules[self.config["kernel"]]
@@ -93,7 +96,7 @@ class PIDHashTable(plugins.PluginInterface):
             seen_upids.add(upid.vol.offset)
 
             pid_chain = upid.pid_chain
-            if not (pid_chain.next and pid_chain.next.is_readable()):
+            if not (pid_chain and vmlinux_layer.is_valid(pid_chain.vol.offset)):
                 break
 
             upid = linux.LinuxUtilities.container_of(
@@ -102,6 +105,7 @@ class PIDHashTable(plugins.PluginInterface):
 
     def _get_upids(self):
         vmlinux = self.context.modules[self.config["kernel"]]
+        vmlinux_layer = self.context.layers[vmlinux.layer_name]
 
         # 2.6.24 <= kernels < 4.15
         pidhash = self._get_pidhash_array()
@@ -111,7 +115,7 @@ class PIDHashTable(plugins.PluginInterface):
             # each entry in the hlist is a upid which is wrapped in a pid
             ent = hlist.first
 
-            while ent and ent.is_readable():
+            while ent and vmlinux_layer.is_valid(ent.vol.offset):
                 # upid->pid_chain exists 2.6.24 <= kernel < 4.15
                 upid = linux.LinuxUtilities.container_of(
                     ent.vol.offset, "upid", "pid_chain", vmlinux
@@ -139,7 +143,7 @@ class PIDHashTable(plugins.PluginInterface):
                 continue
 
             pid_tasks_0 = pid.tasks[pidtype_pid].first
-            if not (pid_tasks_0 and pid_tasks_0.is_readable()):
+            if not pid_tasks_0:
                 continue
 
             task = vmlinux.object(
@@ -156,7 +160,7 @@ class PIDHashTable(plugins.PluginInterface):
         pidtype_pid = self._get_pidtype_pid()
 
         pid_tasks_0 = pid.tasks[pidtype_pid].first
-        if not (pid_tasks_0 and pid_tasks_0.is_readable()):
+        if not pid_tasks_0:
             return None
 
         task_struct_type = vmlinux.get_type("task_struct")
@@ -194,11 +198,15 @@ class PIDHashTable(plugins.PluginInterface):
 
         has_pid_numbers = vmlinux.has_type("pid") and vmlinux.get_type(
             "pid"
-        ).has_member("numbers")  # kernels >= 2.6.24
+        ).has_member(
+            "numbers"
+        )  # kernels >= 2.6.24
 
         has_pid_chain = vmlinux.has_type("upid") and vmlinux.get_type(
             "upid"
-        ).has_member("pid_chain")  # 2.6.24 <= kernels < 4.15
+        ).has_member(
+            "pid_chain"
+        )  # 2.6.24 <= kernels < 4.15
 
         # kernels >= 4.15
         pid_idr = vmlinux.has_type("pid_namespace") and vmlinux.get_type(
@@ -214,7 +222,7 @@ class PIDHashTable(plugins.PluginInterface):
 
         return None
 
-    def get_tasks(self) -> Iterable[interfaces.objects.ObjectInterface]:
+    def get_tasks(self) -> interfaces.objects.ObjectInterface:
         """Enumerates processes through the PID hash table
 
         Yields:
@@ -227,16 +235,14 @@ class PIDHashTable(plugins.PluginInterface):
 
         yield from sorted(pid_func(), key=lambda t: (t.tgid, t.pid))
 
-    def _generator(self, decorate_comm: bool = False):
+    def _generator(
+        self, decorate_comm: bool = False
+    ) -> interfaces.objects.ObjectInterface:
         for task in self.get_tasks():
-            task_fields = pslist.PsList.get_task_fields(task, decorate_comm)
-            fields = (
-                format_hints.Hex(task_fields.offset),
-                task_fields.user_pid,
-                task_fields.user_tid,
-                task_fields.user_ppid,
-                task_fields.name,
+            offset, pid, tid, ppid, name = pslist.PsList.get_task_fields(
+                task, decorate_comm
             )
+            fields = format_hints.Hex(offset), pid, tid, ppid, name
             yield 0, fields
 
     def run(self):

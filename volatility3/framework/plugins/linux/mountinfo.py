@@ -36,7 +36,8 @@ class MountInfo(plugins.PluginInterface):
     """Lists mount points on processes mount namespaces"""
 
     _required_framework_version = (2, 2, 0)
-    _version = (1, 2, 4)
+
+    _version = (1, 2, 0)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -44,10 +45,10 @@ class MountInfo(plugins.PluginInterface):
             requirements.ModuleRequirement(
                 name="kernel",
                 description="Linux kernel",
-                architectures=["Intel32", "Intel64"],
+                architectures=["Intel32", "Intel64", "AArch64"],
             ),
-            requirements.VersionRequirement(
-                name="pslist", component=pslist.PsList, version=(4, 0, 0)
+            requirements.PluginRequirement(
+                name="pslist", plugin=pslist.PsList, version=(2, 0, 0)
             ),
             requirements.VersionRequirement(
                 name="linuxutils", component=linux.LinuxUtilities, version=(2, 1, 0)
@@ -93,13 +94,10 @@ class MountInfo(plugins.PluginInterface):
             return None
 
         mnt_root_path = mnt_root.path()
+        superblock = mnt.get_mnt_sb()
 
         mnt_id: int = mnt.mnt_id
         parent_id: int = mnt.mnt_parent.mnt_id
-
-        superblock = mnt.get_mnt_sb()
-        if not (superblock and superblock.is_readable()):
-            return None
 
         st_dev = f"{superblock.major}:{superblock.minor}"
 
@@ -155,11 +153,9 @@ class MountInfo(plugins.PluginInterface):
             if not (
                 task
                 and task.fs
-                and task.fs.is_readable()
+                and task.fs.root
                 and task.nsproxy
-                and task.nsproxy.is_readable()
                 and task.nsproxy.mnt_ns
-                and task.nsproxy.mnt_ns.is_readable()
             ):
                 # This task doesn't have all the information required.
                 # It should be a kernel < 2.6.30
@@ -276,16 +272,11 @@ class MountInfo(plugins.PluginInterface):
                 continue
 
             sb_ptr = mnt.get_mnt_sb()
-            if not (sb_ptr and sb_ptr.is_readable()):
+            if not sb_ptr or sb_ptr in seen_sb_ptr:
                 continue
+            seen_sb_ptr.add(sb_ptr)
 
-            if sb_ptr in seen_sb_ptr:
-                continue
-            seen_sb_ptr.add(int(sb_ptr))
-
-            superblock = sb_ptr.dereference()
-
-            yield superblock, path_root
+            yield sb_ptr.dereference(), path_root
 
     def run(self):
         pids = self.config.get("pids")

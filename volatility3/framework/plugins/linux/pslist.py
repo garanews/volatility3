@@ -1,10 +1,7 @@
 # This file is Copyright 2021 Volatility Foundation and licensed under the Volatility Software License 1.0
 # which is available at https://www.volatilityfoundation.org/license/vsl-v1.0
 #
-import datetime
-import dataclasses
-import contextlib
-from typing import Any, Callable, Iterable, List, Optional
+from typing import Any, Callable, Iterable, List, Tuple
 
 from volatility3.framework import interfaces, renderers
 from volatility3.framework.configuration import requirements
@@ -12,29 +9,15 @@ from volatility3.framework.objects import utility
 from volatility3.framework.renderers import format_hints
 from volatility3.framework.symbols import intermed
 from volatility3.framework.symbols.linux.extensions import elf
-from volatility3.plugins import timeliner
 from volatility3.plugins.linux import elfs
 
 
-@dataclasses.dataclass
-class TaskFields:
-    offset: int
-    user_pid: int
-    user_tid: int
-    user_ppid: int
-    name: str
-    uid: Optional[int]
-    gid: Optional[int]
-    euid: Optional[int]
-    egid: Optional[int]
-    creation_time: Optional[datetime.datetime]
-
-
-class PsList(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface):
+class PsList(interfaces.plugins.PluginInterface):
     """Lists the processes present in a particular linux memory image."""
 
-    _required_framework_version = (2, 13, 0)
-    _version = (4, 1, 1)
+    _required_framework_version = (2, 0, 0)
+
+    _version = (2, 2, 1)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -42,21 +25,16 @@ class PsList(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface):
             requirements.ModuleRequirement(
                 name="kernel",
                 description="Linux kernel",
-                architectures=["Intel32", "Intel64"],
+                architectures=["Intel32", "Intel64", "AArch64"],
             ),
-            requirements.VersionRequirement(
-                name="elfs", component=elfs.Elfs, version=(2, 0, 0)
+            requirements.PluginRequirement(
+                name="elfs", plugin=elfs.Elfs, version=(2, 0, 0)
             ),
             requirements.ListRequirement(
                 name="pid",
                 description="Filter on specific process IDs",
                 element_type=int,
                 optional=True,
-            ),
-            requirements.VersionRequirement(
-                name="timeliner",
-                component=timeliner.TimeLinerInterface,
-                version=(1, 0, 0),
             ),
             requirements.BooleanRequirement(
                 name="threads",
@@ -79,9 +57,7 @@ class PsList(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface):
         ]
 
     @classmethod
-    def create_pid_filter(
-        cls, pid_list: Optional[List[int]] = None
-    ) -> Callable[[Any], bool]:
+    def create_pid_filter(cls, pid_list: List[int] = None) -> Callable[[Any], bool]:
         """Constructs a filter function for process IDs.
 
         Args:
@@ -90,6 +66,7 @@ class PsList(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface):
         Returns:
             Function which, when provided a process object, returns True if the process is to be filtered out of the list
         """
+        # FIXME: mypy #4973 or #2608
         pid_list = pid_list or []
         filter_list = [x for x in pid_list if x is not None]
         if filter_list:
@@ -104,7 +81,7 @@ class PsList(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface):
     @classmethod
     def get_task_fields(
         cls, task: interfaces.objects.ObjectInterface, decorate_comm: bool = False
-    ) -> TaskFields:
+    ) -> Tuple[int, int, int, str]:
         """Extract the fields needed for the final output
 
         Args:
@@ -113,8 +90,11 @@ class PsList(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface):
                            and of Kernel threads in square brackets.
                            Defaults to False.
         Returns:
-            A TaskFields object with the fields to show in the plugin output.
+            A tuple with the fields to show in the plugin output.
         """
+        pid = task.tgid
+        tid = task.pid
+        ppid = task.parent.tgid if task.parent else 0
         name = utility.array_to_string(task.comm)
         if decorate_comm:
             if task.is_kernel_thread:
@@ -122,25 +102,8 @@ class PsList(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface):
             elif task.is_user_thread:
                 name = f"{{{name}}}"
 
-        # This function may be called with a partially initialized/uninitialized task.
-        # Ensure it always returns a valid TaskFields object, ready for use in a plugin.
-        valid_cred = task.cred and task.cred.is_readable()
-        creation_time = None
-        with contextlib.suppress(Exception):
-            creation_time = task.get_create_time()
-
-        return TaskFields(
-            offset=task.vol.offset,
-            user_pid=task.tgid,
-            user_tid=task.pid,
-            user_ppid=task.get_parent_pid(),
-            name=name,
-            uid=task.cred.uid if valid_cred else None,
-            gid=task.cred.gid if valid_cred else None,
-            euid=task.cred.euid if valid_cred else None,
-            egid=task.cred.egid if valid_cred else None,
-            creation_time=creation_time,
-        )
+        task_fields = (task.vol.offset, pid, tid, ppid, name)
+        return task_fields
 
     def _get_file_output(self, task: interfaces.objects.ObjectInterface) -> str:
         """Extract the elf for the process if requested
@@ -183,10 +146,6 @@ class PsList(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface):
                 file_output = "VMA start matching task start_code not found"
         return file_output
 
-    @staticmethod
-    def _format_cred(cred):
-        return renderers.NotAvailableValue() if cred is None else cred
-
     def _generator(
         self,
         pid_filter: Callable[[Any], bool],
@@ -218,28 +177,15 @@ class PsList(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface):
             else:
                 file_output = "Disabled"
 
-            task_fields = self.get_task_fields(task, decorate_comm)
+            offset, pid, tid, ppid, name = self.get_task_fields(task, decorate_comm)
 
-            task_uid = self._format_cred(task_fields.uid)
-            task_gid = self._format_cred(task_fields.gid)
-            task_euid = self._format_cred(task_fields.euid)
-            task_egid = self._format_cred(task_fields.egid)
-
-            yield (
-                0,
-                (
-                    format_hints.Hex(task_fields.offset),
-                    task_fields.user_pid,
-                    task_fields.user_tid,
-                    task_fields.user_ppid,
-                    task_fields.name,
-                    task_uid,
-                    task_gid,
-                    task_euid,
-                    task_egid,
-                    task_fields.creation_time or renderers.NotAvailableValue(),
-                    file_output,
-                ),
+            yield 0, (
+                format_hints.Hex(offset),
+                pid,
+                tid,
+                ppid,
+                name,
+                file_output,
             )
 
     @classmethod
@@ -260,32 +206,29 @@ class PsList(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface):
         Yields:
             Task objects
         """
+        import struct as _struct
         vmlinux = context.modules[vmlinux_module_name]
 
         init_task = vmlinux.object_from_symbol(symbol_name="init_task")
 
         # Note that the init_task itself is not yielded, since "ps" also never shows it.
-        seen = set()
-        for forward in (True, False):
-            for task in init_task.tasks.to_list(
-                symbol_type=init_task.vol.type_name,
-                member="tasks",
-                forward=forward,
-            ):
-                if task.vol.offset in seen:
+        for task in init_task.tasks:
+            try:
+                va = task.vol.offset
+                # RPi Zero 2W: salta task con pid=0 (entry corrotte alla fine della lista)
+                raw4 = context.layers.read(vmlinux.layer_name, va + 0x588, 4, pad=True)
+                if _struct.unpack('<I', raw4)[0] == 0:
                     continue
-                seen.add(task.vol.offset)
+            except Exception:
+                continue
 
-                if not task.is_valid():
-                    continue
+            if filter_func(task):
+                continue
 
-                if filter_func(task):
-                    continue
+            yield task
 
-                yield task
-
-                if include_threads:
-                    yield from task.get_threads()
+            if include_threads:
+                yield from task.get_threads()
 
     def run(self):
         pids = self.config.get("pid")
@@ -300,28 +243,8 @@ class PsList(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface):
             ("TID", int),
             ("PPID", int),
             ("COMM", str),
-            ("UID", int),
-            ("GID", int),
-            ("EUID", int),
-            ("EGID", int),
-            ("CREATION TIME", datetime.datetime),
             ("File output", str),
         ]
         return renderers.TreeGrid(
             columns, self._generator(filter_func, include_threads, decorate_comm, dump)
         )
-
-    def generate_timeline(self):
-        pids = self.config.get("pid")
-        filter_func = self.create_pid_filter(pids)
-        for task in self.list_tasks(
-            self.context, self.config["kernel"], filter_func, include_threads=True
-        ):
-            task_fields = self.get_task_fields(task)
-            description = f"Process {task_fields.user_pid}/{task_fields.user_tid} {task_fields.name} ({task_fields.offset})"
-
-            yield (
-                description,
-                timeliner.TimeLinerType.CREATED,
-                task_fields.creation_time,
-            )

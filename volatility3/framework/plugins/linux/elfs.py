@@ -1,8 +1,8 @@
 # This file is Copyright 2019 Volatility Foundation and licensed under the Volatility Software License 1.0
 # which is available at https://www.volatilityfoundation.org/license/vsl-v1.0
 #
-"""A module containing a plugin for enumerating memory-mapped
-ELF files across all processes."""
+"""A module containing a collection of plugins that produce data typically
+found in Linux's /proc file system."""
 
 import logging
 from typing import List, Optional, Type
@@ -14,7 +14,7 @@ from volatility3.framework.objects import utility
 from volatility3.framework.renderers import format_hints
 from volatility3.framework.symbols import intermed
 from volatility3.framework.symbols.linux.extensions import elf
-from volatility3.framework.constants import linux as linux_constants
+from volatility3.framework.constants.linux import ELF_MAX_EXTRACTION_SIZE
 from volatility3.plugins.linux import pslist
 
 
@@ -25,7 +25,7 @@ class Elfs(plugins.PluginInterface):
     """Lists all memory mapped ELF files for all processes."""
 
     _required_framework_version = (2, 0, 0)
-    _version = (2, 0, 3)
+    _version = (2, 0, 1)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -33,10 +33,10 @@ class Elfs(plugins.PluginInterface):
             requirements.ModuleRequirement(
                 name="kernel",
                 description="Linux kernel",
-                architectures=["Intel32", "Intel64"],
+                architectures=["Intel32", "Intel64", "AArch64"],
             ),
-            requirements.VersionRequirement(
-                name="pslist", component=pslist.PsList, version=(4, 0, 0)
+            requirements.PluginRequirement(
+                name="pslist", plugin=pslist.PsList, version=(2, 0, 0)
             ),
             requirements.ListRequirement(
                 name="pid",
@@ -116,7 +116,7 @@ class Elfs(plugins.PluginInterface):
             real_size = end - start
 
             # Check if ELF has a legitimate size
-            if real_size < 0 or real_size > linux_constants.ELF_MAX_EXTRACTION_SIZE:
+            if real_size < 0 or real_size > ELF_MAX_EXTRACTION_SIZE:
                 raise ValueError(f"The claimed size of the ELF is invalid: {real_size}")
 
             sections[start] = real_size
@@ -177,7 +177,7 @@ class Elfs(plugins.PluginInterface):
                         name,
                         format_hints.Hex(vma.vm_start),
                         format_hints.Hex(vma.vm_end),
-                        path or renderers.NotAvailableValue(),
+                        path,
                         file_output,
                     ),
                 )

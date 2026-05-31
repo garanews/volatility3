@@ -24,7 +24,7 @@ class IOMem(interfaces.plugins.PluginInterface):
             requirements.ModuleRequirement(
                 name="kernel",
                 description="Linux kernel",
-                architectures=["Intel32", "Intel64"],
+                architectures=["Intel32", "Intel64", "AArch64"],
             )
         ]
 
@@ -59,7 +59,7 @@ class IOMem(interfaces.plugins.PluginInterface):
                 f"Unable to create resource object at {resource_offset:#x}. This resource, "
                 "its sibling, and any of it's children and will be missing from the output."
             )
-            return
+            return None
 
         # get name with protection against smear as following a pointer
         try:
@@ -71,15 +71,6 @@ class IOMem(interfaces.plugins.PluginInterface):
             )
             name = renderers.UnreadableValue()
 
-        try:
-            start = resource.start
-            end = resource.end
-        except exceptions.InvalidAddressException:
-            vollog.warning(
-                f"Unable to follow pointer to start and end for resource object at {resource_offset:#x}. Skipping entry."
-            )
-            return
-
         # mark this resource as seen in the seen set. Normally this should not be needed but will protect
         # against possible infinite loops. Warn the user if an infinite loop would have happened.
         if resource_offset in seen:
@@ -88,12 +79,12 @@ class IOMem(interfaces.plugins.PluginInterface):
                 "this should not normally occur. No further results from related resources will be "
                 "displayed to protect against infinite loops."
             )
-            return
+            return None
         else:
             seen.add(resource_offset)
 
         # yield information on this resource
-        yield depth, (name, start, end)
+        yield depth, (name, resource.start, resource.end)
 
         # process child resource if this exists
         if resource.child != 0:

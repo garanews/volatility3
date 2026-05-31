@@ -122,7 +122,7 @@ ISF_MINIMUM_DEPRECATED = (3, 9, 9)
 OFFLINE = False
 """Whether to go online to retrieve missing/necessary JSON files"""
 
-REMOTE_ISF_URL = None  # 'http://localhost:8000/banners.json'
+REMOTE_ISF_URL = "https://github.com/Abyss-W4tcher/volatility3-symbols/raw/master/banners/banners.json"  # 'http://localhost:8000/banners.json'
 """Remote URL to query for a list of ISF addresses"""
 
 DOWNLOAD_TIMEOUT = 30

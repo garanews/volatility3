@@ -1,34 +1,62 @@
 # This file is Copyright 2023 Volatility Foundation and licensed under the Volatility Software License 1.0
 # which is available at https://www.volatilityfoundation.org/license/vsl-v1.0
 #
+# RPi Zero 2W patch: scan fisico per task_struct usando pid+comm
 import logging
-from typing import Iterable, List
 import struct
+import re
+from typing import Iterable, List, Tuple
 from enum import Enum
 
-from volatility3.framework import renderers, interfaces, symbols, constants, exceptions
+from volatility3.framework import renderers, interfaces, constants, exceptions
 from volatility3.framework.configuration import requirements
-from volatility3.framework.layers import scanners
+from volatility3.framework.objects import utility
 from volatility3.framework.renderers import format_hints
-from volatility3.plugins.linux import pslist
 
 vollog = logging.getLogger(__name__)
 
+PID_OFFSET   = 0x588
+TGID_OFFSET  = 0x58c
+COMM_OFFSET  = 0x770
+TASKS_OFFSET = 0x4b8
+PAGE_OFFSET_VMALLOC = 0xffffff8000000000
+
+# Regex per comm validi: almeno 3 char, alfanumerici + /:-_.[]@
+COMM_RE = re.compile(rb'^[a-zA-Z0-9_\-./:\[\]@ ]{3,15}$')
 
 class DescExitStateEnum(Enum):
-    """Enum for linux task exit_state as defined in include/linux/sched.h"""
-
     TASK_RUNNING = 0x00000000
-    EXIT_DEAD = 0x00000010
-    EXIT_ZOMBIE = 0x00000020
-    EXIT_TRACE = EXIT_ZOMBIE | EXIT_DEAD
+    EXIT_DEAD    = 0x00000010
+    EXIT_ZOMBIE  = 0x00000020
+    EXIT_TRACE   = EXIT_ZOMBIE | EXIT_DEAD
+
+
+def _is_valid_comm(comm_bytes: bytes) -> bool:
+    """Filtra comm plausibili per processi Linux reali."""
+    if len(comm_bytes) < 3:
+        return False
+    if not COMM_RE.match(comm_bytes):
+        return False
+    # Escludi pattern tipici di falsi positivi
+    # (sezioni ELF, stringhe C, pattern kernel non-process)
+    fp_patterns = [
+        b'_state', b'_free', b'mount', b'_remove', b'_create',
+        b'.symtab', b'.strtab', b'.rodata', b'.text', b'.plt',
+        b'_sched_', b'syscall', b'mpoline', b'__param',
+        b'720x480', b'crtc_sta', b'drm', b'ion_usec',
+        b'vblankof', b'v_free', b'_newsel', b'_llseek',
+    ]
+    for fp in fp_patterns:
+        if fp in comm_bytes:
+            return False
+    return True
 
 
 class PsScan(interfaces.plugins.PluginInterface):
-    """Scans for processes present in a particular linux image."""
+    """Scans for processes present in a particular linux image (RPi AArch64)."""
 
-    _required_framework_version = (2, 13, 0)
-    _version = (2, 0, 0)
+    _required_framework_version = (2, 0, 0)
+    _version = (1, 0, 1)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -36,39 +64,33 @@ class PsScan(interfaces.plugins.PluginInterface):
             requirements.ModuleRequirement(
                 name="kernel",
                 description="Linux kernel",
-                architectures=["Intel32", "Intel64"],
-            ),
-            requirements.VersionRequirement(
-                name="pslist", component=pslist.PsList, version=(4, 0, 0)
-            ),
-            requirements.VersionRequirement(
-                name="multi_string_scanner",
-                component=scanners.MultiStringScanner,
-                version=(1, 0, 0),
+                architectures=["Intel32", "Intel64", "AArch64"],
             ),
         ]
 
     def _generator(self):
-        """Generates the tasks found from scanning."""
-
         vmlinux_module_name = self.config["kernel"]
         vmlinux = self.context.modules[vmlinux_module_name]
 
         for task in self.scan_tasks(
             self.context, vmlinux_module_name, vmlinux.layer_name
         ):
-            task_fields = pslist.PsList.get_task_fields(task)
-            exit_state = DescExitStateEnum(task.exit_state).name
-            fields = (
-                format_hints.Hex(task_fields.offset),
-                task_fields.user_pid,
-                task_fields.user_tid,
-                task_fields.user_ppid,
-                task_fields.name,
-                exit_state,
-            )
-
-            yield (0, fields)
+            try:
+                pid  = task.tgid
+                tid  = task.pid
+                ppid = 0
+                try:
+                    ppid = task.parent.tgid
+                except Exception:
+                    pass
+                name = utility.array_to_string(task.comm)
+                try:
+                    exit_state = DescExitStateEnum(task.exit_state).name
+                except ValueError:
+                    exit_state = "UNKNOWN"
+                yield (0, (format_hints.Hex(task.vol.offset), pid, tid, ppid, name, exit_state))
+            except Exception:
+                continue
 
     @classmethod
     def scan_tasks(
@@ -77,93 +99,82 @@ class PsScan(interfaces.plugins.PluginInterface):
         vmlinux_module_name: str,
         kernel_layer_name: str,
     ) -> Iterable[interfaces.objects.ObjectInterface]:
-        """Scans for tasks in the memory layer.
-
-        Args:
-            context: The context to retrieve required elements (layers, symbol tables) from
-            vmlinux_module_name: The name of the kernel module on which to operate
-            kernel_layer_name: The name for the kernel layer
-        Yields:
-            Task objects
-        """
         vmlinux = context.modules[vmlinux_module_name]
-
-        # check if this image is 32bit or 64bit
-        is_32bit = not symbols.symbol_table_is_64bit(
-            context=context, symbol_table_name=vmlinux.symbol_table_name
-        )
-        if is_32bit:
-            pack_format = "I"
-        else:
-            pack_format = "Q"
-        # get task_struct to find the offset to the sched_class pointer
-        sched_class_offset = vmlinux.get_type("task_struct").members["sched_class"][0]
         kernel_layer = context.layers[kernel_layer_name]
 
-        needles = []
-        for symbol in vmlinux.symbols:
-            # find all sched_class names by searching by if they include '_sched_class', e.g. 'fair_sched_class'
-            if "_sched_class" in symbol:
-                # use canonicalize to set the appropriate sign extension for the addr
-                addr = kernel_layer.canonicalize(
-                    vmlinux.get_symbol(symbol).address + vmlinux.offset
-                )
-                packed_addr = struct.pack(pack_format, addr)
-
-                # debug message to show needles being searched for and symbol names
-                vollog.debug(
-                    f"Found a sched_class named {symbol} at offset {hex(addr)}. Will scan for these bytes: {packed_addr.hex()}"
-                )
-
-                # append to needles list the packed hex for searching
-                needles.append(packed_addr)
-        # find the memory layer to scan
-        if len(kernel_layer.dependencies) > 1:
-            vollog.warning(
-                f"Kernel layer depends on multiple layers however only {kernel_layer.dependencies[0]} will be scanned by this plugin."
-            )
-        elif len(kernel_layer.dependencies) == 0:
-            vollog.error(
-                "Kernel layer has no dependencies, meaning there is no memory layer for this plugin to scan."
-            )
-            raise exceptions.LayerException(
-                kernel_layer_name, f"Layer {kernel_layer_name} has no dependencies"
-            )
+        if not kernel_layer.dependencies:
+            raise exceptions.LayerException(kernel_layer_name, "No dependencies")
         memory_layer_name = kernel_layer.dependencies[0]
         memory_layer = context.layers[memory_layer_name]
 
-        # scan the memory_layer for these needles
-        for address, _ in memory_layer.scan(
-            context, scanners.MultiStringScanner(needles)
-        ):
-            # create task in the memory_layer
-            ptask = context.object(
-                vmlinux.symbol_table_name + constants.BANG + "task_struct",
-                offset=address - sched_class_offset,
-                layer_name=memory_layer_name,
-                native_layer_name=kernel_layer_name,
-            )
+        vollog.info(f"RPi psscan v2: scanning {memory_layer_name}")
 
-            # sanity check exit_state
+        seen_phys = set()
+        chunk_size = 4 * 1024 * 1024
+
+        phys = memory_layer.minimum_address
+        max_phys = memory_layer.maximum_address
+
+        while phys < max_phys:
             try:
-                # attempt tp parse the exist_state using the enum
-                DescExitStateEnum(ptask.exit_state)
-            except ValueError:
-                vollog.debug(
-                    f"Skipping task_struct at {hex(ptask.vol.offset)} as exit_state {ptask.exit_state} is likely not valid"
+                chunk = context.layers.read(
+                    memory_layer_name, phys,
+                    min(chunk_size, max_phys - phys), pad=True
                 )
+            except Exception:
+                phys += chunk_size
                 continue
-            # sanity check pid
-            if not (0 < ptask.pid < 65535):
-                vollog.debug(
-                    f"Skipping task_struct at {hex(ptask.vol.offset)} as pid {ptask.pid} is likely not valid"
-                )
-                continue
-            yield ptask
+
+            for i in range(0, len(chunk) - COMM_OFFSET - 20, 8):
+                if i + COMM_OFFSET + 16 > len(chunk):
+                    break
+
+                pid_val  = struct.unpack_from('<I', chunk, i + PID_OFFSET)[0]
+                tgid_val = struct.unpack_from('<I', chunk, i + TGID_OFFSET)[0]
+
+                # pid deve essere plausibile
+                if not (1 <= pid_val <= 65534):
+                    continue
+                # tgid deve essere uguale a pid (thread leader) o plausibile
+                if tgid_val != pid_val:
+                    if not (1 <= tgid_val <= 65534):
+                        continue
+                    # tgid > pid non ha senso per un leader
+                    if tgid_val > pid_val + 100:
+                        continue
+
+                comm_bytes = chunk[i + COMM_OFFSET: i + COMM_OFFSET + 16]
+                comm_end = comm_bytes.find(b'\x00')
+                if comm_end < 3:
+                    continue
+                comm_str = comm_bytes[:comm_end]
+
+                if not _is_valid_comm(comm_str):
+                    continue
+
+                task_phys = phys + i
+                if task_phys in seen_phys:
+                    continue
+                seen_phys.add(task_phys)
+
+                task_va = task_phys + PAGE_OFFSET_VMALLOC
+
+                try:
+                    ptask = context.object(
+                        vmlinux.symbol_table_name + constants.BANG + "task_struct",
+                        offset=task_va,
+                        layer_name=kernel_layer_name,
+                        native_layer_name=kernel_layer_name,
+                    )
+                    yield ptask
+                except Exception:
+                    continue
+
+            phys += chunk_size
 
     def run(self):
         columns = [
-            ("OFFSET (P)", format_hints.Hex),
+            ("OFFSET (V)", format_hints.Hex),
             ("PID", int),
             ("TID", int),
             ("PPID", int),

@@ -5,15 +5,13 @@
 import logging
 from typing import Callable, Tuple, List, Dict
 
-from volatility3.framework import interfaces, exceptions, constants, objects, renderers
-from volatility3.framework.renderers import format_hints
+from volatility3.framework import interfaces, exceptions, constants, objects
+from volatility3.framework.renderers import TreeGrid, NotAvailableValue, format_hints
 from volatility3.framework.configuration import requirements
 from volatility3.framework.interfaces import plugins
 from volatility3.framework.objects import utility
 from volatility3.framework.symbols import linux
 from volatility3.plugins.linux import lsof
-from volatility3.plugins.linux import pslist
-from volatility3.framework.symbols.linux import network
 
 
 vollog = logging.getLogger(__name__)
@@ -22,29 +20,18 @@ vollog = logging.getLogger(__name__)
 class SockHandlers(interfaces.configuration.VersionableInterface):
     """Handles several socket families extracting the sockets information."""
 
-    _required_framework_version = (2, 22, 0)
-    _version = (4, 0, 0)
-    _net_version_required = (1, 0, 0)
+    _required_framework_version = (2, 0, 0)
 
-    def __init__(self, context, vmlinux_name, task, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._vmlinux = context.modules[vmlinux_name]
-        self._symbol_table = context.symbol_space[self._vmlinux.symbol_table_name]
+    _version = (1, 0, 0)
+
+    def __init__(self, vmlinux, task):
+        self._vmlinux = vmlinux
         self._task = task
-
-        if not requirements.VersionRequirement.matches_required(
-            network.NetSymbols.version, self._net_version_required
-        ):
-            raise ValueError(
-                f"Version mismatch of volatility library NetSymbols version ({network.NetSymbols.version}) and needed version ({self._net_version_required})"
-            )
-
-        network.NetSymbols.apply(self._symbol_table)
 
         try:
             netns_id = task.nsproxy.net_ns.get_inode()
         except AttributeError:
-            netns_id = renderers.NotAvailableValue()
+            netns_id = NotAvailableValue()
 
         self._netdevices = self._build_network_devices_map(netns_id)
 
@@ -79,7 +66,7 @@ class SockHandlers(interfaces.configuration.VersionableInterface):
             )
             for net_dev in net.dev_base_head.to_list(net_device_symname, "dev_list"):
                 if (
-                    isinstance(netns_id, renderers.NotAvailableValue)
+                    isinstance(netns_id, NotAvailableValue)
                     or net.get_inode() != netns_id
                 ):
                     continue
@@ -263,7 +250,7 @@ class SockHandlers(interfaces.configuration.VersionableInterface):
             # Kernel >= 3.7.10
             src_port = netlink_sock.get_portid()
         except AttributeError:
-            src_port = renderers.NotAvailableValue()
+            src_port = NotAvailableValue()
 
         dst_addr = f"group:0x{netlink_sock.dst_group:08x}"
         module = netlink_sock.module
@@ -273,7 +260,7 @@ class SockHandlers(interfaces.configuration.VersionableInterface):
         try:
             dst_port = netlink_sock.get_dst_portid()
         except AttributeError:
-            dst_port = renderers.NotAvailableValue()
+            dst_port = NotAvailableValue()
 
         state = netlink_sock.get_state()
 
@@ -384,7 +371,7 @@ class SockHandlers(interfaces.configuration.VersionableInterface):
         bt_sock = sock.cast("bt_sock")
 
         def bt_addr(addr):
-            return ":".join(reversed([f"{x:02x}" for x in addr.b]))
+            return ":".join(reversed(["%02x" % x for x in addr.b]))
 
         src_addr = src_port = dst_addr = dst_port = None
         bt_protocol = bt_sock.get_protocol()
@@ -450,7 +437,8 @@ class Sockstat(plugins.PluginInterface):
     """Lists all network connections for all processes."""
 
     _required_framework_version = (2, 0, 0)
-    _version = (3, 0, 4)
+
+    _version = (1, 0, 0)
 
     @classmethod
     def get_requirements(cls):
@@ -458,22 +446,22 @@ class Sockstat(plugins.PluginInterface):
             requirements.ModuleRequirement(
                 name="kernel",
                 description="Linux kernel",
-                architectures=["Intel32", "Intel64"],
+                architectures=["Intel32", "Intel64", "AArch64"],
             ),
             requirements.VersionRequirement(
-                name="SockHandlers", component=SockHandlers, version=(4, 0, 0)
+                name="SockHandlers", component=SockHandlers, version=(1, 0, 0)
             ),
-            requirements.VersionRequirement(
-                name="lsof", component=lsof.Lsof, version=(2, 0, 0)
-            ),
-            requirements.VersionRequirement(
-                name="pslist", component=pslist.PsList, version=(4, 0, 0)
+            requirements.PluginRequirement(
+                name="lsof", plugin=lsof.Lsof, version=(1, 1, 0)
             ),
             requirements.VersionRequirement(
                 name="linuxutils", component=linux.LinuxUtilities, version=(2, 0, 0)
             ),
-            requirements.VersionRequirement(
-                name="linux_net", component=network.NetSymbols, version=(1, 0, 0)
+            requirements.BooleanRequirement(
+                name="unix",
+                description=("Show UNIX domain Sockets only"),
+                default=False,
+                optional=True,
             ),
             requirements.ListRequirement(
                 name="pids",
@@ -518,43 +506,69 @@ class Sockstat(plugins.PluginInterface):
         sfop_addr = vmlinux.object_from_symbol("socket_file_ops").vol.offset
         dfop_addr = vmlinux.object_from_symbol("sockfs_dentry_operations").vol.offset
 
+        # AArch64 RPi: on vmalloc layout f_op addresses may differ from
+        # kernel static symbols. Build a mask to compare only the lower 32 bits,
+        # and also allow match via dentry name "socket:".
+        ADDR_MASK = 0xFFFFFFFF
+
+        def _is_socket_fop(fop_addr):
+            """Check if fop_addr matches socket_file_ops or sockfs_dentry_operations.
+            On AArch64 with vmalloc layout the upper bits may differ, so we
+            fall back to comparing the lower 32 bits as well."""
+            if fop_addr in (sfop_addr, dfop_addr):
+                return True
+            fop_low = fop_addr & ADDR_MASK
+            if fop_low in (sfop_addr & ADDR_MASK, dfop_addr & ADDR_MASK):
+                return True
+            return False
+
         fd_generator = lsof.Lsof.list_fds(context, vmlinux.name, filter_func)
-        for fd_internal in fd_generator:
-            fd_num, filp, _full_path = fd_internal.fd_fields
-            task = fd_internal.task
+        _total = 0
+        import sys
+        for _pid, _task_comm, task, fd_fields in fd_generator:
+            fd_num, filp, _full_path = fd_fields
+            _total += 1
+            if _pid in (982, 1063, 967):
+                print(f"[DBG] pid={_pid} fd={fd_num} fop={hex(filp.f_op)} path={_full_path}", file=sys.stderr)
 
-            if not (filp.f_op and filp.f_op.is_readable()):
-                continue
-
-            if filp.f_op not in (sfop_addr, dfop_addr):
-                continue
+            # Primary check: f_op pointer comparison (may fail on AArch64 vmalloc)
+            fop_match = _is_socket_fop(filp.f_op)
 
             dentry = filp.get_dentry()
-            if not (dentry and dentry.is_readable()):
+            if not dentry:
                 continue
 
+            # Secondary check: dentry name is "socket:" (AArch64 fallback)
+            if not fop_match:
+                try:
+                    dname = utility.array_to_string(dentry.d_name.name.cast(
+                        "array", count=8,
+                        subtype=vmlinux.get_type("char")
+                    ))
+                    if not dname.startswith("socket"):
+                        continue
+                except Exception:
+                    continue
+
             d_inode = dentry.d_inode
-            if not (d_inode and d_inode.is_readable()):
+            if not d_inode:
                 continue
 
             socket_alloc = linux.LinuxUtilities.container_of(
                 d_inode, "socket_alloc", "vfs_inode", vmlinux
             )
-            if not socket_alloc:
-                continue
             socket = socket_alloc.socket
-            if not (socket.sk and socket.sk.is_readable()):
+
+            if not (socket and socket.sk):
                 continue
+
             sock = socket.sk.dereference()
 
-            try:
-                sock_type = sock.get_type()
-                family = sock.get_family()
-                sock_handler = SockHandlers(context, vmlinux.name, task)
-                sock_fields = sock_handler.process_sock(sock)
-            except exceptions.InvalidAddressException:
-                continue
+            sock_type = sock.get_type()
+            family = sock.get_family()
 
+            sock_handler = SockHandlers(vmlinux, task)
+            sock_fields = sock_handler.process_sock(sock)
             if not sock_fields:
                 continue
 
@@ -565,7 +579,7 @@ class Sockstat(plugins.PluginInterface):
             try:
                 netns_id = net.get_inode()
             except AttributeError:
-                netns_id = renderers.NotAvailableValue()
+                netns_id = NotAvailableValue()
 
             yield task, netns_id, fd_num, family, sock_type, protocol, sock_fields
 
@@ -580,15 +594,14 @@ class Sockstat(plugins.PluginInterface):
             `sock_stat` and `protocol` formatted.
         """
         sock_stat = [
-            renderers.NotAvailableValue() if field is None else str(field)
-            for field in sock_stat
+            NotAvailableValue() if field is None else str(field) for field in sock_stat
         ]
         if protocol is None:
-            protocol = renderers.NotAvailableValue()
+            protocol = NotAvailableValue()
 
         return tuple(sock_stat), protocol
 
-    def _generator(self, pids: List[int], netns_id_arg: int, kernel_module_name: str):
+    def _generator(self, pids: List[int], netns_id_arg: int, symbol_table: str):
         """Enumerate tasks sockets. Each row represents a kernel socket.
 
         Args:
@@ -609,13 +622,9 @@ class Sockstat(plugins.PluginInterface):
             tasks: String with a list of tasks and FDs using a socket. It can also have
                    extended information such as socket filters, bpf info, etc.
         """
-        vmlinux = self.context.modules[kernel_module_name]
-        symbol_table = self.context.symbol_space[vmlinux.symbol_table_name]
-        network.NetSymbols.apply(symbol_table)
-
-        filter_func = pslist.PsList.create_pid_filter(pids)
+        filter_func = lsof.pslist.PsList.create_pid_filter(pids)
         socket_generator = self.list_sockets(
-            self.context, kernel_module_name, filter_func=filter_func
+            self.context, symbol_table, filter_func=filter_func
         )
 
         for (
@@ -636,15 +645,11 @@ class Sockstat(plugins.PluginInterface):
             socket_filter_str = (
                 ",".join(f"{k}={v}" for k, v in extended.items())
                 if extended
-                else renderers.NotAvailableValue()
+                else NotAvailableValue()
             )
-
-            task_comm = utility.array_to_string(task.comm)
 
             fields = (
                 netns_id,
-                task_comm,
-                task.tgid,
                 task.pid,
                 fd_num,
                 format_hints.Hex(sock.vol.offset),
@@ -660,13 +665,11 @@ class Sockstat(plugins.PluginInterface):
     def run(self):
         pids = self.config.get("pids")
         netns_id = self.config["netns"]
-        kernel_module_name = self.config["kernel"]
+        symbol_table = self.config["kernel"]
 
         tree_grid_args = [
             ("NetNS", int),
-            ("Process Name", str),
-            ("PID", int),
-            ("TID", int),
+            ("Pid", int),
             ("FD", int),
             ("Sock Offset", format_hints.Hex),
             ("Family", str),
@@ -680,6 +683,4 @@ class Sockstat(plugins.PluginInterface):
             ("Filter", str),
         ]
 
-        return renderers.TreeGrid(
-            tree_grid_args, self._generator(pids, netns_id, kernel_module_name)
-        )
+        return TreeGrid(tree_grid_args, self._generator(pids, netns_id, symbol_table))
