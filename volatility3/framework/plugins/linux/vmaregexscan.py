@@ -35,7 +35,7 @@ class VmaRegExScan(plugins.PluginInterface):
                 architectures=["Intel32", "Intel64", "AArch64"],
             ),
             requirements.VersionRequirement(
-                name="pslist", component=pslist.PsList, version=(4, 0, 0)
+                name="pslist", component=pslist.PsList, version=(2, 0, 0)
             ),
             requirements.ListRequirement(
                 name="pid",
@@ -134,4 +134,5 @@ class VmaRegExScan(plugins.PluginInterface):
                 ),
             ),
         )
+
 

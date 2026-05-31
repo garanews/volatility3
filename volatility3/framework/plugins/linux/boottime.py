@@ -31,7 +31,7 @@ class Boottime(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface)
                 version=(1, 0, 0),
             ),
             requirements.VersionRequirement(
-                name="pslist", component=pslist.PsList, version=(4, 0, 0)
+                name="pslist", component=pslist.PsList, version=(2, 0, 0)
             ),
         ]
 
@@ -100,4 +100,5 @@ class Boottime(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface)
             ("Boot Time", datetime.datetime),
         ]
         return renderers.TreeGrid(columns, self._generator())
+
 

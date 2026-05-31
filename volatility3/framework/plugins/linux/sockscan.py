@@ -41,7 +41,7 @@ class Sockscan(plugins.PluginInterface):
                 name="lsof", component=lsof.Lsof, version=(2, 0, 0)
             ),
             requirements.VersionRequirement(
-                name="pslist", component=pslist.PsList, version=(4, 1, 0)
+                name="pslist", component=pslist.PsList, version=(2, 0, 0)
             ),
             requirements.VersionRequirement(
                 name="linuxutils", component=linux.LinuxUtilities, version=(2, 1, 0)
@@ -472,4 +472,5 @@ class Sockscan(plugins.PluginInterface):
             tree_grid_args,
             self._generator(self.config["kernel"]),
         )
+
 

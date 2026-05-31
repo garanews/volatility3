@@ -1,4 +1,4 @@
-# This file is Copyright 2024 Volatility Foundation and licensed under the Volatility Software License 1.0
+﻿# This file is Copyright 2024 Volatility Foundation and licensed under the Volatility Software License 1.0
 # which is available at https://www.volatilityfoundation.org/license/vsl-v1.0
 #
 import logging
@@ -45,7 +45,7 @@ class Kthreads(plugins.PluginInterface):
                 name="linuxutils", component=linux.LinuxUtilities, version=(2, 1, 0)
             ),
             requirements.VersionRequirement(
-                name="pslist", component=pslist.PsList, version=(4, 0, 0)
+                name="pslist", component=pslist.PsList, version=(2, 0, 0)
             ),
         ]
 
@@ -131,3 +131,4 @@ class Kthreads(plugins.PluginInterface):
             ],
             self._generator(),
         )
+
