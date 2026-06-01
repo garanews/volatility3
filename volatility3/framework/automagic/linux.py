@@ -329,19 +329,28 @@ class LinuxAArch64SubStacker:
             progress_callback=progress_callback,
         )
         _rpi_override = False
+        PAGE_OFFSET_STATIC = 0xffffffc07fe00000
         if kaslr_shift == 0:
-            # swapper_pg_dir e' un simbolo statico: usa PAGE_OFFSET_STATIC per VA->PA
-            PAGE_OFFSET_STATIC = 0xffffffc07fe00000
-            PGD_PHYS_REAL = 0x14d3000
-            pgd_phys_json = (table.get_symbol("swapper_pg_dir").address - PAGE_OFFSET_STATIC) & 0x0000FFFFFFFFFFFF
-            kaslr_shift = PGD_PHYS_REAL - pgd_phys_json
-            aslr_shift = kaslr_shift
-            _rpi_override = True
-            self._logger.debug(f"RPi override: kaslr_shift={hex(kaslr_shift)}, pgd_phys={hex(PGD_PHYS_REAL)}")
+            # find_aslr failed: derive PGD physical address by walking page tables
+            # using the known physical address of linux_banner in the dump
+            pgd_phys_real = self._find_pgd_from_banner(
+                context, layer_name, banner, PAGE_OFFSET_STATIC
+            )
+            if pgd_phys_real is not None:
+                pgd_phys_json = (table.get_symbol("swapper_pg_dir").address - PAGE_OFFSET_STATIC) & 0x0000FFFFFFFFFFFF
+                kaslr_shift = pgd_phys_real - pgd_phys_json
+                aslr_shift = kaslr_shift
+                _rpi_override = True
+                self._logger.debug(f"RPi auto-detect: pgd_phys={hex(pgd_phys_real)}, kaslr_shift={hex(kaslr_shift)}")
+            else:
+                self._logger.debug("RPi auto-detect: could not find PGD, falling back to 0x14d3000")
+                PGD_PHYS_REAL = 0x14d3000
+                pgd_phys_json = (table.get_symbol("swapper_pg_dir").address - PAGE_OFFSET_STATIC) & 0x0000FFFFFFFFFFFF
+                kaslr_shift = PGD_PHYS_REAL - pgd_phys_json
+                aslr_shift = kaslr_shift
+                _rpi_override = True
 
         ttb1_va = table.get_symbol("swapper_pg_dir").address + kaslr_shift
-        # swapper_pg_dir e' un simbolo statico: usa PAGE_OFFSET_STATIC per VA->PA
-        PAGE_OFFSET_STATIC = 0xffffffc07fe00000
         ttb1 = (ttb1_va - PAGE_OFFSET_STATIC) & 0x0000FFFFFFFFFFFF
         context.config[path_join(config_path, arm.AArch64RegMap.TTBR1_EL1.__name__)] = (
             arm.set_reg_bits(ttb1, arm.AArch64RegMap.TTBR1_EL1.BADDR)
@@ -489,6 +498,80 @@ class LinuxAArch64SubStacker:
                     return layer
                 else:
                     layer.destroy()
+
+        return None
+
+    @classmethod
+    def _find_pgd_from_banner(
+        cls,
+        context: interfaces.context.ContextInterface,
+        layer_name: str,
+        banner: bytes,
+        page_offset: int,
+        scan_start: int = 0x1000000,
+        scan_end: int = 0x2000000,
+    ):
+        """Find swapper_pg_dir physical address by scanning for a PGD that correctly
+        maps the linux_banner virtual address to its known physical location."""
+        phys_layer = context.layers[layer_name]
+
+        # Find banner physical address by scanning
+        banner_prefix = banner[:40]
+        banner_phys = None
+        for offset, _ in phys_layer.scan(
+            context=context,
+            scanner=scanners.MultiStringScanner([banner_prefix]),
+        ):
+            banner_phys = offset
+            break
+
+        if banner_phys is None:
+            cls._logger.debug("_find_pgd_from_banner: banner not found in physical layer")
+            return None
+
+        banner_virt = (banner_phys + page_offset) & 0xFFFFFFFFFFFFFFFF
+        banner_page_phys = banner_phys & ~0xFFF
+
+        # Compute page table indices (VA_BITS=39, 4K pages, 3-level)
+        pgd_idx = (banner_virt >> 30) & 0x1FF
+        pmd_idx = (banner_virt >> 21) & 0x1FF
+        pte_idx = (banner_virt >> 12) & 0x1FF
+
+        cls._logger.debug(
+            f"_find_pgd_from_banner: banner_phys={hex(banner_phys)}, "
+            f"virt={hex(banner_virt)}, PGD[{pgd_idx}] PMD[{pmd_idx}] PTE[{pte_idx}]"
+        )
+
+        def read_u64(phys):
+            try:
+                data = phys_layer.read(phys, 8)
+                return int.from_bytes(data, byteorder="little")
+            except Exception:
+                return None
+
+        def is_table_desc(entry, phys_limit=0x40000000):
+            if entry is None or not (entry & 1):
+                return False
+            oa = entry & 0x0000FFFFFFFFF000
+            return oa > 0 and oa < phys_limit
+
+        # Scan for PGD pages
+        for pgd_phys in range(scan_start, scan_end, 0x1000):
+            pgd_entry = read_u64(pgd_phys + pgd_idx * 8)
+            if not is_table_desc(pgd_entry):
+                continue
+            pmd_table_phys = pgd_entry & 0x0000FFFFFFFFF000
+            pmd_entry = read_u64(pmd_table_phys + pmd_idx * 8)
+            if not is_table_desc(pmd_entry):
+                continue
+            pte_table_phys = pmd_entry & 0x0000FFFFFFFFF000
+            pte_entry = read_u64(pte_table_phys + pte_idx * 8)
+            if pte_entry is None or not (pte_entry & 1):
+                continue
+            oa = pte_entry & 0x0000FFFFFFFFF000
+            if oa == banner_page_phys:
+                cls._logger.debug(f"_find_pgd_from_banner: found PGD at {hex(pgd_phys)}")
+                return pgd_phys
 
         return None
 
