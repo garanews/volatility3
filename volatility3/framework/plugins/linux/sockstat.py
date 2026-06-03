@@ -33,7 +33,11 @@ class SockHandlers(interfaces.configuration.VersionableInterface):
         except AttributeError:
             netns_id = NotAvailableValue()
 
-        self._netdevices = self._build_network_devices_map(netns_id)
+        try:
+            self._netdevices = self._build_network_devices_map(netns_id)
+        except Exception as e:
+            vollog.debug(f"SockHandlers: could not build netdevices map: {e}")
+            self._netdevices = {}
 
         self._sock_family_handlers = {
             "AF_UNIX": self._unix_sock,
@@ -523,65 +527,60 @@ class Sockstat(plugins.PluginInterface):
             return False
 
         fd_generator = lsof.Lsof.list_fds(context, vmlinux.name, filter_func)
-        _total = 0
-        import sys
         for _pid, _task_comm, task, fd_fields in fd_generator:
             fd_num, filp, _full_path = fd_fields
-            _total += 1
-            if _pid in (982, 1063, 967):
-                print(f"[DBG] pid={_pid} fd={fd_num} fop={hex(filp.f_op)} path={_full_path}", file=sys.stderr)
 
-            # Primary check: f_op pointer comparison (may fail on AArch64 vmalloc)
+            # Primary check: f_op pointer comparison
             fop_match = _is_socket_fop(filp.f_op)
 
             dentry = filp.get_dentry()
             if not dentry:
                 continue
 
-            # Secondary check: dentry name is "socket:" (AArch64 fallback)
+            # Secondary check: path contains socket inode pattern ":[N]".
+            # Handles both "socket:[N]" (normal) and
+            # "<unknown d_dname pointer> ADDR:[N]" (AArch64 sockfs pseudo-dentry
+            # when socket_file_ops address in the JSON is wrong).
             if not fop_match:
-                try:
-                    dname = utility.array_to_string(dentry.d_name.name.cast(
-                        "array", count=8,
-                        subtype=vmlinux.get_type("char")
-                    ))
-                    if not dname.startswith("socket"):
-                        continue
-                except Exception:
+                if ":[" not in (_full_path or ""):
                     continue
 
-            d_inode = dentry.d_inode
-            if not d_inode:
-                continue
-
-            socket_alloc = linux.LinuxUtilities.container_of(
-                d_inode, "socket_alloc", "vfs_inode", vmlinux
-            )
-            socket = socket_alloc.socket
-
-            if not (socket and socket.sk):
-                continue
-
-            sock = socket.sk.dereference()
-
-            sock_type = sock.get_type()
-            family = sock.get_family()
-
-            sock_handler = SockHandlers(vmlinux, task)
-            sock_fields = sock_handler.process_sock(sock)
-            if not sock_fields:
-                continue
-
-            child_sock = sock_fields[0]
-            protocol = child_sock.get_protocol()
-
-            net = task.nsproxy.net_ns
             try:
-                netns_id = net.get_inode()
-            except AttributeError:
-                netns_id = NotAvailableValue()
+                d_inode = dentry.d_inode
+                if not d_inode:
+                    continue
 
-            yield task, netns_id, fd_num, family, sock_type, protocol, sock_fields
+                socket_alloc = linux.LinuxUtilities.container_of(
+                    d_inode, "socket_alloc", "vfs_inode", vmlinux
+                )
+                socket = socket_alloc.socket
+
+                if not (socket and socket.sk):
+                    continue
+
+                sock = socket.sk.dereference()
+
+                sock_type = sock.get_type()
+                family = sock.get_family()
+
+                sock_handler = SockHandlers(vmlinux, task)
+                sock_fields = sock_handler.process_sock(sock)
+                if not sock_fields:
+                    continue
+
+                child_sock = sock_fields[0]
+                protocol = child_sock.get_protocol()
+
+                net = task.nsproxy.net_ns
+                try:
+                    netns_id = net.get_inode()
+                except AttributeError:
+                    netns_id = NotAvailableValue()
+
+                yield task, netns_id, fd_num, family, sock_type, protocol, sock_fields
+            except exceptions.InvalidAddressException as e:
+                vollog.debug(f"sockstat: skipping fd {fd_num} of pid {_pid}: {e}")
+                continue
 
     def _format_fields(self, sock_stat, protocol):
         """Prepare the socket fields to be rendered

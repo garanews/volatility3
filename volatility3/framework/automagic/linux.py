@@ -339,15 +339,28 @@ class LinuxAArch64SubStacker:
             if pgd_phys_real is not None:
                 pgd_phys_json = (table.get_symbol("swapper_pg_dir").address - PAGE_OFFSET_STATIC) & 0x0000FFFFFFFFFFFF
                 kaslr_shift = pgd_phys_real - pgd_phys_json
-                aslr_shift = kaslr_shift
+                # aslr_shift drives the module offset for symbol lookups. When the
+                # cross-compiled vmlinux differs in layout from the actual kernel,
+                # kaslr_shift (from swapper_pg_dir) and the symbol address shift
+                # can diverge. Compute aslr_shift from the actual init_task location.
+                task_aslr = self._find_aslr_from_init_task(
+                    context, layer_name, table, PAGE_OFFSET_STATIC
+                )
+                aslr_shift = task_aslr if task_aslr is not None else kaslr_shift
                 _rpi_override = True
-                self._logger.debug(f"RPi auto-detect: pgd_phys={hex(pgd_phys_real)}, kaslr_shift={hex(kaslr_shift)}")
+                self._logger.debug(
+                    f"RPi auto-detect: pgd_phys={hex(pgd_phys_real)}, "
+                    f"kaslr_shift={hex(kaslr_shift)}, aslr_shift={hex(aslr_shift)}"
+                )
             else:
                 self._logger.debug("RPi auto-detect: could not find PGD, falling back to 0x14d3000")
                 PGD_PHYS_REAL = 0x14d3000
                 pgd_phys_json = (table.get_symbol("swapper_pg_dir").address - PAGE_OFFSET_STATIC) & 0x0000FFFFFFFFFFFF
                 kaslr_shift = PGD_PHYS_REAL - pgd_phys_json
-                aslr_shift = kaslr_shift
+                task_aslr = self._find_aslr_from_init_task(
+                    context, layer_name, table, PAGE_OFFSET_STATIC
+                )
+                aslr_shift = task_aslr if task_aslr is not None else kaslr_shift
                 _rpi_override = True
 
         ttb1_va = table.get_symbol("swapper_pg_dir").address + kaslr_shift
@@ -573,6 +586,47 @@ class LinuxAArch64SubStacker:
                 cls._logger.debug(f"_find_pgd_from_banner: found PGD at {hex(pgd_phys)}")
                 return pgd_phys
 
+        return None
+
+    @classmethod
+    def _find_aslr_from_init_task(
+        cls,
+        context: interfaces.context.ContextInterface,
+        layer_name: str,
+        table,
+        page_offset: int,
+    ):
+        """Compute aslr_shift by scanning for swapper/0 comm field in the kernel region.
+
+        When the cross-compiled vmlinux has different symbol placement than the
+        actual running kernel, kaslr_shift (derived from swapper_pg_dir) cannot
+        be used as the module offset. This method finds the real init_task physical
+        address and computes the shift needed for correct symbol-table lookups.
+        """
+        try:
+            comm_offset = table.get_type("task_struct").vol.members["comm"][0]
+            init_task_json_virt = table.get_symbol("init_task").address
+        except Exception as e:
+            cls._logger.debug(f"_find_aslr_from_init_task: setup failed: {e}")
+            return None
+
+        phys_layer = context.layers[layer_name]
+        for offset, _ in phys_layer.scan(
+            context=context,
+            scanner=scanners.MultiStringScanner([b"swapper/0\x00"]),
+        ):
+            init_task_phys = offset - comm_offset
+            if init_task_phys <= 0:
+                continue
+            init_task_actual_virt = (init_task_phys + page_offset) & 0xFFFFFFFFFFFFFFFF
+            aslr_shift = (init_task_actual_virt - init_task_json_virt) & 0xFFFFFFFFFFFFFFFF
+            cls._logger.debug(
+                f"_find_aslr_from_init_task: comm_phys={hex(offset)}, "
+                f"init_task_phys={hex(init_task_phys)}, aslr_shift={hex(aslr_shift)}"
+            )
+            return aslr_shift
+
+        cls._logger.debug("_find_aslr_from_init_task: swapper/0 not found")
         return None
 
     @classmethod

@@ -304,7 +304,16 @@ class LinuxUtilities(interfaces.configuration.VersionableInterface):
             else:
                 pre_name = f"<unsupported d_op symbol> {sym}"
         else:
-            pre_name = f"<unknown d_dname pointer> {sym_addr:x}"
+            # sym_addr not in JSON symbol table (e.g. cross-compiled vmlinux with
+            # different symbol placement than the actual running kernel).
+            # Fall back to inode mode for readable names.
+            i_fmt = inode.i_mode & 0xF000
+            if i_fmt == 0xC000:  # S_IFSOCK
+                pre_name = "socket"
+            elif i_fmt == 0x1000:  # S_IFIFO
+                pre_name = "pipe"
+            else:
+                pre_name = f"<unknown d_dname pointer> {sym_addr:x}"
 
         return f"{pre_name}:[{inode.i_ino:d}]"
 
