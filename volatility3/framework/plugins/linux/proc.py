@@ -192,12 +192,16 @@ class Maps(plugins.PluginInterface):
                 inode = 0
 
                 if vma.vm_file != 0:
-                    dentry = vma.vm_file.get_dentry()
-                    if dentry != 0:
-                        inode_object = dentry.d_inode
-                        major = inode_object.i_sb.major
-                        minor = inode_object.i_sb.minor
-                        inode = inode_object.i_ino
+                    try:
+                        dentry = vma.vm_file.get_dentry()
+                        if dentry and dentry != 0:
+                            inode_object = dentry.d_inode
+                            if inode_object and inode_object != 0:
+                                major = inode_object.i_sb.major
+                                minor = inode_object.i_sb.minor
+                                inode = inode_object.i_ino
+                    except exceptions.InvalidAddressException:
+                        pass
                 path = vma.get_name(self.context, task)
 
                 file_output = "Disabled"
