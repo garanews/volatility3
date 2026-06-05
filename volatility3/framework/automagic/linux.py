@@ -333,7 +333,7 @@ class LinuxAArch64SubStacker:
         if kaslr_shift == 0:
             # find_aslr failed: derive PGD physical address by walking page tables
             # using the known physical address of linux_banner in the dump
-            pgd_phys_real = self._find_pgd_from_banner(
+            pgd_phys_real, actual_page_offset = self._find_pgd_from_banner(
                 context, layer_name, banner, PAGE_OFFSET_STATIC
             )
             if pgd_phys_real is not None:
@@ -342,9 +342,10 @@ class LinuxAArch64SubStacker:
                 # aslr_shift drives the module offset for symbol lookups. When the
                 # cross-compiled vmlinux differs in layout from the actual kernel,
                 # kaslr_shift (from swapper_pg_dir) and the symbol address shift
-                # can diverge. Compute aslr_shift from the actual init_task location.
+                # can diverge. Compute aslr_shift from the actual init_task location,
+                # using the PAGE_OFFSET found by the PGD scan (handles KASLR).
                 task_aslr = self._find_aslr_from_init_task(
-                    context, layer_name, table, PAGE_OFFSET_STATIC
+                    context, layer_name, table, actual_page_offset
                 )
                 aslr_shift = task_aslr if task_aslr is not None else kaslr_shift
                 _rpi_override = True
@@ -352,16 +353,6 @@ class LinuxAArch64SubStacker:
                     f"RPi auto-detect: pgd_phys={hex(pgd_phys_real)}, "
                     f"kaslr_shift={hex(kaslr_shift)}, aslr_shift={hex(aslr_shift)}"
                 )
-            else:
-                self._logger.debug("RPi auto-detect: could not find PGD, falling back to 0x14d3000")
-                PGD_PHYS_REAL = 0x14d3000
-                pgd_phys_json = (table.get_symbol("swapper_pg_dir").address - PAGE_OFFSET_STATIC) & 0x0000FFFFFFFFFFFF
-                kaslr_shift = PGD_PHYS_REAL - pgd_phys_json
-                task_aslr = self._find_aslr_from_init_task(
-                    context, layer_name, table, PAGE_OFFSET_STATIC
-                )
-                aslr_shift = task_aslr if task_aslr is not None else kaslr_shift
-                _rpi_override = True
 
         ttb1_va = table.get_symbol("swapper_pg_dir").address + kaslr_shift
         ttb1 = (ttb1_va - PAGE_OFFSET_STATIC) & 0x0000FFFFFFFFFFFF
@@ -524,8 +515,12 @@ class LinuxAArch64SubStacker:
         scan_start: int = 0x1000000,
         scan_end: int = 0x2000000,
     ):
-        """Find swapper_pg_dir physical address by scanning for a PGD that correctly
-        maps the linux_banner virtual address to its known physical location."""
+        """Find swapper_pg_dir physical address and actual PAGE_OFFSET.
+
+        Returns (pgd_phys, actual_page_offset) or (None, page_offset) on failure.
+        Falls back to a full kernel-half scan when KASLR shifts the virtual base
+        beyond the range expected from page_offset.
+        """
         phys_layer = context.layers[layer_name]
 
         # Find banner physical address by scanning
@@ -540,7 +535,7 @@ class LinuxAArch64SubStacker:
 
         if banner_phys is None:
             cls._logger.debug("_find_pgd_from_banner: banner not found in physical layer")
-            return None
+            return None, page_offset
 
         banner_virt = (banner_phys + page_offset) & 0xFFFFFFFFFFFFFFFF
         banner_page_phys = banner_phys & ~0xFFF
@@ -568,7 +563,7 @@ class LinuxAArch64SubStacker:
             oa = entry & 0x0000FFFFFFFFF000
             return oa > 0 and oa < phys_limit
 
-        # Scan for PGD pages
+        # Fast path: try with assumed page_offset
         for pgd_phys in range(scan_start, scan_end, 0x1000):
             pgd_entry = read_u64(pgd_phys + pgd_idx * 8)
             if not is_table_desc(pgd_entry):
@@ -579,14 +574,59 @@ class LinuxAArch64SubStacker:
                 continue
             pte_table_phys = pmd_entry & 0x0000FFFFFFFFF000
             pte_entry = read_u64(pte_table_phys + pte_idx * 8)
-            if pte_entry is None or not (pte_entry & 1):
-                continue
-            oa = pte_entry & 0x0000FFFFFFFFF000
-            if oa == banner_page_phys:
-                cls._logger.debug(f"_find_pgd_from_banner: found PGD at {hex(pgd_phys)}")
-                return pgd_phys
+            if pte_entry is not None and (pte_entry & 1):
+                oa = pte_entry & 0x0000FFFFFFFFF000
+                if oa == banner_page_phys:
+                    cls._logger.debug(f"_find_pgd_from_banner: found PGD at {hex(pgd_phys)}")
+                    return pgd_phys, page_offset
 
-        return None
+        # KASLR fallback: virtual base shifted — try all kernel-half PGD indices.
+        # This handles CONFIG_RANDOMIZE_BASE dumps where pgd_idx derived from
+        # the static PAGE_OFFSET is wrong.
+        cls._logger.debug(
+            "_find_pgd_from_banner: fast path failed, "
+            "KASLR fallback — scanning all kernel PGD indices"
+        )
+        phys_limit = getattr(phys_layer, "maximum_address", 0x40000000)
+
+        def is_table_kaslr(entry):
+            if entry is None or not (entry & 3 == 3):
+                return False
+            oa = entry & 0x0000FFFFFFFFF000
+            return 0x1000 <= oa < phys_limit
+
+        for pgd_phys in range(scan_start, scan_end, 0x1000):
+            for k_pgd_idx in range(256, 512):
+                pgd_entry = read_u64(pgd_phys + k_pgd_idx * 8)
+                if not is_table_kaslr(pgd_entry):
+                    continue
+                pmd_table_phys = pgd_entry & 0x0000FFFFFFFFF000
+                for k_pmd_idx in range(512):
+                    pmd_entry = read_u64(pmd_table_phys + k_pmd_idx * 8)
+                    if not is_table_kaslr(pmd_entry):
+                        continue
+                    pte_table_phys = pmd_entry & 0x0000FFFFFFFFF000
+                    for k_pte_idx in range(512):
+                        pte_entry = read_u64(pte_table_phys + k_pte_idx * 8)
+                        if pte_entry is None or not (pte_entry & 1):
+                            continue
+                        oa = pte_entry & 0x0000FFFFFFFFF000
+                        if oa == banner_page_phys:
+                            actual_virt = (
+                                0xFFFFFF8000000000
+                                | (k_pgd_idx << 30)
+                                | (k_pmd_idx << 21)
+                                | (k_pte_idx << 12)
+                                | (banner_phys & 0xFFF)
+                            )
+                            actual_page_offset = (actual_virt - banner_phys) & 0xFFFFFFFFFFFFFFFF
+                            cls._logger.debug(
+                                f"_find_pgd_from_banner: KASLR found PGD at {hex(pgd_phys)}, "
+                                f"actual_page_offset={hex(actual_page_offset)}"
+                            )
+                            return pgd_phys, actual_page_offset
+
+        return None, page_offset
 
     @classmethod
     def _find_aslr_from_init_task(
