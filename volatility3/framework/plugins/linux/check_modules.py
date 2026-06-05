@@ -45,9 +45,11 @@ class Check_modules(plugins.PluginInterface):
             module_kset = None
 
         if not module_kset:
-            raise TypeError(
-                "This plugin requires the module_kset structure. This structure is not present in the supplied symbol table. This means you are either analyzing an unsupported kernel version or that your symbol table is corrupt."
+            vollog.warning(
+                "module_kset symbol not found or unreadable; "
+                "check_modules cannot compare kset against lsmod"
             )
+            return {}
 
         ret = {}
 
