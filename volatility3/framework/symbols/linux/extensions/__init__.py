@@ -947,9 +947,13 @@ class maple_tree(objects.StructType):
                 f"The depth for the maple tree at {hex(self.vol.offset)} is {expected_maple_tree_depth}, however when parsing the nodes "
                 f"a depth of {current_depth} was reached. This is unexpected and may lead to incorrect results."
             )
+            return None
 
         # parse the mte to extract the pointer value, node type, and leaf status
         pointer = maple_tree_entry & ~(self.MAPLE_NODE_POINTER_MASK)
+
+        if pointer == 0:
+            return None
         node_type = (
             maple_tree_entry >> self.MAPLE_NODE_TYPE_SHIFT
         ) & self.MAPLE_NODE_TYPE_MASK
