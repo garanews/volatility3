@@ -1279,6 +1279,9 @@ class vm_area_struct(objects.StructType):
             except exceptions.InvalidAddressException:
                 return False
 
+            if inode is None:
+                return False
+
             # Verify that a file-backed VMA's page offset
             # is not greater than the size of the file's inode.
             # Check only inode sizes greater than 0 to account for
